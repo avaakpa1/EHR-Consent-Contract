@@ -14,6 +14,7 @@
 (define-constant ERR_PATIENT_ONLY (err u108))
 (define-constant ERR_HOSPITAL_NOT_REGISTERED (err u109))
 (define-constant ERR_ALREADY_EXISTS (err u110))
+(define-constant ERR_INVALID_TIME_RANGE (err u111))
 
 (define-data-var last-token-id uint u0)
 (define-data-var oracle-address (optional principal) none)
@@ -51,6 +52,21 @@
     { access-count: uint, last-accessed: uint }
 )
 
+(define-map patient-analytics
+    { patient: principal }
+    { total-access-count: uint, unique-hospitals: uint, first-grant: uint, last-access: uint }
+)
+
+(define-map hospital-analytics
+    { hospital: principal }
+    { total-accesses: uint, unique-patients: uint, avg-permission-level: uint, compliance-score: uint }
+)
+
+(define-map time-based-analytics
+    { time-period: uint, entity: principal }
+    { access-count: uint, grant-count: uint, revoke-count: uint }
+)
+
 (define-read-only (get-last-token-id)
     (var-get last-token-id)
 )
@@ -81,6 +97,28 @@
 
 (define-read-only (get-permission-usage (token-id uint))
     (map-get? permission-usage { token-id: token-id })
+)
+
+(define-read-only (get-patient-analytics (patient principal))
+    (map-get? patient-analytics { patient: patient })
+)
+
+(define-read-only (get-hospital-analytics (hospital principal))
+    (map-get? hospital-analytics { hospital: hospital })
+)
+
+(define-read-only (get-time-analytics (time-period uint) (entity principal))
+    (map-get? time-based-analytics { time-period: time-period, entity: entity })
+)
+
+(define-read-only (get-permission-level-score (permission (string-ascii 10)))
+    (if (is-eq permission "read")
+        u1
+        (if (is-eq permission "modify")
+            u2
+            (if (is-eq permission "admin")
+                u3
+                u0)))
 )
 
 (define-read-only (is-valid-permission (permission (string-ascii 10)))
@@ -220,6 +258,10 @@
             )
         )
         
+        (update-patient-analytics-on-grant tx-sender hospital current-block)
+        (update-hospital-analytics-on-grant hospital tx-sender permission-level)
+        (update-time-analytics-on-grant current-block tx-sender)
+        
         (ok token-id)
     )
 )
@@ -256,6 +298,10 @@
                 last-accessed: current-block
             }
         )
+        
+        (update-patient-analytics-on-access (get patient permission-data) current-block)
+        (update-hospital-analytics-on-access (get hospital permission-data))
+        (update-time-analytics-on-access current-block (get patient permission-data))
         
         (ok {
             ehr-hash: (get ehr-hash permission-data),
@@ -320,5 +366,135 @@
             data
         )
         data
+    )
+)
+
+(define-private (update-patient-analytics-on-grant (patient principal) (hospital principal) (current-block uint))
+    (let
+        (
+            (existing-analytics (map-get? patient-analytics { patient: patient }))
+        )
+        (map-set patient-analytics
+            { patient: patient }
+            (match existing-analytics
+                analytics (merge analytics { 
+                    unique-hospitals: (if (is-hospital-new-for-patient patient hospital)
+                        (+ (get unique-hospitals analytics) u1)
+                        (get unique-hospitals analytics))
+                })
+                { total-access-count: u0, unique-hospitals: u1, first-grant: current-block, last-access: u0 }
+            )
+        )
+    )
+)
+
+(define-private (update-hospital-analytics-on-grant (hospital principal) (patient principal) (permission-level (string-ascii 10)))
+    (let
+        (
+            (existing-analytics (map-get? hospital-analytics { hospital: hospital }))
+            (permission-score (get-permission-level-score permission-level))
+        )
+        (map-set hospital-analytics
+            { hospital: hospital }
+            (match existing-analytics
+                analytics (merge analytics { 
+                    unique-patients: (if (is-patient-new-for-hospital hospital patient)
+                        (+ (get unique-patients analytics) u1)
+                        (get unique-patients analytics)),
+                    avg-permission-level: (/ (+ (* (get avg-permission-level analytics) (get unique-patients analytics)) permission-score) (+ (get unique-patients analytics) u1))
+                })
+                { total-accesses: u0, unique-patients: u1, avg-permission-level: permission-score, compliance-score: u100 }
+            )
+        )
+    )
+)
+
+(define-private (update-time-analytics-on-grant (current-block uint) (entity principal))
+    (let
+        (
+            (time-period (/ current-block u144))
+            (existing-analytics (map-get? time-based-analytics { time-period: time-period, entity: entity }))
+        )
+        (map-set time-based-analytics
+            { time-period: time-period, entity: entity }
+            (match existing-analytics
+                analytics (merge analytics { grant-count: (+ (get grant-count analytics) u1) })
+                { access-count: u0, grant-count: u1, revoke-count: u0 }
+            )
+        )
+    )
+)
+
+(define-private (update-patient-analytics-on-access (patient principal) (current-block uint))
+    (let
+        (
+            (existing-analytics (map-get? patient-analytics { patient: patient }))
+        )
+        (map-set patient-analytics
+            { patient: patient }
+            (match existing-analytics
+                analytics (merge analytics { 
+                    total-access-count: (+ (get total-access-count analytics) u1),
+                    last-access: current-block
+                })
+                { total-access-count: u1, unique-hospitals: u0, first-grant: u0, last-access: current-block }
+            )
+        )
+    )
+)
+
+(define-private (update-hospital-analytics-on-access (hospital principal))
+    (let
+        (
+            (existing-analytics (map-get? hospital-analytics { hospital: hospital }))
+        )
+        (map-set hospital-analytics
+            { hospital: hospital }
+            (match existing-analytics
+                analytics (merge analytics { total-accesses: (+ (get total-accesses analytics) u1) })
+                { total-accesses: u1, unique-patients: u0, avg-permission-level: u0, compliance-score: u100 }
+            )
+        )
+    )
+)
+
+(define-private (update-time-analytics-on-access (current-block uint) (entity principal))
+    (let
+        (
+            (time-period (/ current-block u144))
+            (existing-analytics (map-get? time-based-analytics { time-period: time-period, entity: entity }))
+        )
+        (map-set time-based-analytics
+            { time-period: time-period, entity: entity }
+            (match existing-analytics
+                analytics (merge analytics { access-count: (+ (get access-count analytics) u1) })
+                { access-count: u1, grant-count: u0, revoke-count: u0 }
+            )
+        )
+    )
+)
+
+(define-private (is-hospital-new-for-patient (patient principal) (hospital principal))
+    (is-none (map-get? patient-consent-history { patient: patient, hospital: hospital }))
+)
+
+(define-private (is-patient-new-for-hospital (hospital principal) (patient principal))
+    (is-none (map-get? patient-consent-history { patient: patient, hospital: hospital }))
+)
+
+(define-read-only (get-analytics-summary (entity principal) (time-start uint) (time-end uint))
+    (begin
+        (asserts! (<= time-start time-end) ERR_INVALID_TIME_RANGE)
+        (let
+            (
+                (patient-data (get-patient-analytics entity))
+                (hospital-data (get-hospital-analytics entity))
+            )
+            (ok {
+                patient-data: patient-data,
+                hospital-data: hospital-data,
+                time-range: { start: time-start, end: time-end }
+            })
+        )
     )
 )
