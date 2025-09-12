@@ -15,9 +15,12 @@
 (define-constant ERR_HOSPITAL_NOT_REGISTERED (err u109))
 (define-constant ERR_ALREADY_EXISTS (err u110))
 (define-constant ERR_INVALID_TIME_RANGE (err u111))
+(define-constant ERR_TEMPLATE_NOT_FOUND (err u112))
+(define-constant ERR_TEMPLATE_ALREADY_EXISTS (err u113))
 
 (define-data-var last-token-id uint u0)
 (define-data-var oracle-address (optional principal) none)
+(define-data-var last-template-id uint u0)
 
 (define-map patient-records
     { patient: principal }
@@ -67,8 +70,40 @@
     { access-count: uint, grant-count: uint, revoke-count: uint }
 )
 
+(define-map consent-templates
+    { template-id: uint }
+    {
+        owner: principal,
+        name: (string-ascii 50),
+        permission-level: (string-ascii 10),
+        duration: uint,
+        created-at: uint,
+        active: bool
+    }
+)
+
+(define-map patient-templates
+    { patient: principal, template-name: (string-ascii 50) }
+    { template-id: uint }
+)
+
 (define-read-only (get-last-token-id)
     (var-get last-token-id)
+)
+
+(define-read-only (get-last-template-id)
+    (var-get last-template-id)
+)
+
+(define-read-only (get-consent-template (template-id uint))
+    (map-get? consent-templates { template-id: template-id })
+)
+
+(define-read-only (get-patient-template-by-name (patient principal) (template-name (string-ascii 50)))
+    (match (map-get? patient-templates { patient: patient, template-name: template-name })
+        template-ref (map-get? consent-templates { template-id: (get template-id template-ref) })
+        none
+    )
 )
 
 (define-read-only (get-token-uri (token-id uint))
@@ -169,6 +204,126 @@
             )
             data
         )
+    )
+)
+
+(define-public (create-consent-template (name (string-ascii 50)) (permission-level (string-ascii 10)) (duration uint))
+    (let
+        (
+            (template-id (+ (var-get last-template-id) u1))
+            (current-block stacks-block-height)
+        )
+        (asserts! (is-none (map-get? patient-templates { patient: tx-sender, template-name: name })) ERR_TEMPLATE_ALREADY_EXISTS)
+        (asserts! (is-valid-permission permission-level) ERR_INVALID_PERMISSION)
+        (asserts! (> duration u0) ERR_INVALID_DURATION)
+        
+        (map-set consent-templates
+            { template-id: template-id }
+            {
+                owner: tx-sender,
+                name: name,
+                permission-level: permission-level,
+                duration: duration,
+                created-at: current-block,
+                active: true
+            }
+        )
+        
+        (map-set patient-templates
+            { patient: tx-sender, template-name: name }
+            { template-id: template-id }
+        )
+        
+        (var-set last-template-id template-id)
+        (ok template-id)
+    )
+)
+
+(define-public (update-consent-template (template-id uint) (permission-level (string-ascii 10)) (duration uint))
+    (let
+        (
+            (template-data (unwrap! (map-get? consent-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+        )
+        (asserts! (is-eq tx-sender (get owner template-data)) ERR_UNAUTHORIZED)
+        (asserts! (get active template-data) ERR_TEMPLATE_NOT_FOUND)
+        (asserts! (is-valid-permission permission-level) ERR_INVALID_PERMISSION)
+        (asserts! (> duration u0) ERR_INVALID_DURATION)
+        
+        (map-set consent-templates
+            { template-id: template-id }
+            (merge template-data {
+                permission-level: permission-level,
+                duration: duration
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (deactivate-consent-template (template-id uint))
+    (let
+        (
+            (template-data (unwrap! (map-get? consent-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+        )
+        (asserts! (is-eq tx-sender (get owner template-data)) ERR_UNAUTHORIZED)
+        (map-set consent-templates
+            { template-id: template-id }
+            (merge template-data { active: false })
+        )
+        (ok true)
+    )
+)
+
+(define-public (grant-access-with-template (to principal) (hospital principal) (template-id uint))
+    (let
+        (
+            (template-data (unwrap! (map-get? consent-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+            (token-id (+ (var-get last-token-id) u1))
+            (patient-record (unwrap! (map-get? patient-records { patient: tx-sender }) ERR_NOT_TOKEN_OWNER))
+            (hospital-data (unwrap! (map-get? hospital-registry { hospital: hospital }) ERR_HOSPITAL_NOT_REGISTERED))
+            (current-block stacks-block-height)
+            (expires-at (+ current-block (get duration template-data)))
+        )
+        (asserts! (is-eq tx-sender (get owner template-data)) ERR_UNAUTHORIZED)
+        (asserts! (get active template-data) ERR_TEMPLATE_NOT_FOUND)
+        (asserts! (get verified hospital-data) ERR_HOSPITAL_NOT_REGISTERED)
+        (asserts! (is-valid-permission (get permission-level template-data)) ERR_INVALID_PERMISSION)
+        
+        (try! (nft-mint? ehr-access-key token-id to))
+        
+        (map-set access-permissions
+            { token-id: token-id }
+            {
+                patient: tx-sender,
+                granted-to: to,
+                permission-level: (get permission-level template-data),
+                expires-at: expires-at,
+                revoked: false,
+                hospital: hospital,
+                ehr-hash: (get ehr-hash patient-record)
+            }
+        )
+        
+        (map-set permission-usage
+            { token-id: token-id }
+            { access-count: u0, last-accessed: u0 }
+        )
+        
+        (var-set last-token-id token-id)
+        
+        (map-set patient-consent-history
+            { patient: tx-sender, hospital: hospital }
+            (match (map-get? patient-consent-history { patient: tx-sender, hospital: hospital })
+                history (merge history { total-grants: (+ (get total-grants history) u1), last-granted: current-block })
+                { total-grants: u1, last-granted: current-block }
+            )
+        )
+        
+        (update-patient-analytics-on-grant tx-sender hospital current-block)
+        (update-hospital-analytics-on-grant hospital tx-sender (get permission-level template-data))
+        (update-time-analytics-on-grant current-block tx-sender)
+        
+        (ok token-id)
     )
 )
 
