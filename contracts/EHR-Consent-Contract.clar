@@ -17,10 +17,14 @@
 (define-constant ERR_INVALID_TIME_RANGE (err u111))
 (define-constant ERR_TEMPLATE_NOT_FOUND (err u112))
 (define-constant ERR_TEMPLATE_ALREADY_EXISTS (err u113))
+(define-constant ERR_AUDIT_ACCESS_DENIED (err u114))
+(define-constant ERR_INVALID_AUDIT_LEVEL (err u115))
+(define-constant ERR_AUDIT_NOT_FOUND (err u116))
 
 (define-data-var last-token-id uint u0)
 (define-data-var oracle-address (optional principal) none)
 (define-data-var last-template-id uint u0)
+(define-data-var last-audit-id uint u0)
 
 (define-map patient-records
     { patient: principal }
@@ -87,12 +91,64 @@
     { template-id: uint }
 )
 
+;; Comprehensive Audit Trail System
+(define-map audit-trail
+    { audit-id: uint }
+    {
+        event-type: (string-ascii 20),
+        patient: principal,
+        actor: principal,
+        hospital: (optional principal),
+        token-id: (optional uint),
+        timestamp: uint,
+        block-height: uint,
+        details: (string-ascii 100),
+        severity-level: (string-ascii 10),
+        compliance-flag: bool
+    }
+)
+
+(define-map patient-audit-log
+    { patient: principal }
+    { total-events: uint, last-audit-id: uint, high-risk-events: uint }
+)
+
+(define-map hospital-audit-log
+    { hospital: principal }
+    { total-events: uint, compliance-score: uint, violations: uint }
+)
+
+(define-map audit-search-index
+    { event-type: (string-ascii 20), entity: principal }
+    { event-count: uint, last-event-id: uint }
+)
+
 (define-read-only (get-last-token-id)
     (var-get last-token-id)
 )
 
 (define-read-only (get-last-template-id)
     (var-get last-template-id)
+)
+
+(define-read-only (get-last-audit-id)
+    (var-get last-audit-id)
+)
+
+(define-read-only (get-audit-record (audit-id uint))
+    (map-get? audit-trail { audit-id: audit-id })
+)
+
+(define-read-only (get-patient-audit-summary (patient principal))
+    (map-get? patient-audit-log { patient: patient })
+)
+
+(define-read-only (get-hospital-audit-summary (hospital principal))
+    (map-get? hospital-audit-log { hospital: hospital })
+)
+
+(define-read-only (get-audit-events-by-type (event-type (string-ascii 20)) (entity principal))
+    (map-get? audit-search-index { event-type: event-type, entity: entity })
 )
 
 (define-read-only (get-consent-template (template-id uint))
@@ -162,6 +218,23 @@
             (is-eq permission "admin")))
 )
 
+(define-read-only (is-valid-severity-level (severity (string-ascii 10)))
+    (or (is-eq severity "info")
+        (or (is-eq severity "warning")
+            (or (is-eq severity "critical")
+                (is-eq severity "emergency"))))
+)
+
+(define-read-only (is-valid-event-type (event-type (string-ascii 20)))
+    (or (is-eq event-type "access_granted")
+        (or (is-eq event-type "access_revoked")
+            (or (is-eq event-type "data_accessed")
+                (or (is-eq event-type "permission_expired")
+                    (or (is-eq event-type "emergency_revoke")
+                        (or (is-eq event-type "compliance_check")
+                            (is-eq event-type "security_violation")))))))
+)
+
 (define-read-only (has-valid-access (token-id uint) (accessor principal))
     (match (map-get? access-permissions { token-id: token-id })
         permission-data
@@ -183,6 +256,153 @@
             (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)
             { patient: patient, accessor: accessor, permission: permission-level, found: false }
         )
+    )
+)
+
+;; Comprehensive Audit Trail Functions
+(define-public (create-audit-record 
+    (event-type (string-ascii 20)) 
+    (patient principal) 
+    (hospital (optional principal))
+    (token-id (optional uint))
+    (details (string-ascii 100))
+    (severity-level (string-ascii 10)))
+    (let
+        (
+            (audit-id (+ (var-get last-audit-id) u1))
+            (current-block stacks-block-height)
+            (compliance-flag (not (is-eq severity-level "critical")))
+        )
+        (asserts! (is-valid-event-type event-type) ERR_INVALID_AUDIT_LEVEL)
+        (asserts! (is-valid-severity-level severity-level) ERR_INVALID_AUDIT_LEVEL)
+        (asserts! (or (is-eq tx-sender patient) 
+                     (is-eq tx-sender CONTRACT_OWNER)
+                     (is-some (map-get? hospital-registry { hospital: tx-sender }))) ERR_AUDIT_ACCESS_DENIED)
+        
+        (map-set audit-trail
+            { audit-id: audit-id }
+            {
+                event-type: event-type,
+                patient: patient,
+                actor: tx-sender,
+                hospital: hospital,
+                token-id: token-id,
+                timestamp: current-block,
+                block-height: current-block,
+                details: details,
+                severity-level: severity-level,
+                compliance-flag: compliance-flag
+            }
+        )
+        
+        (update-patient-audit-log patient audit-id severity-level)
+        (match hospital
+            hosp (update-hospital-audit-log hosp severity-level)
+            true
+        )
+        (update-audit-search-index event-type patient audit-id)
+        
+        (var-set last-audit-id audit-id)
+        (ok audit-id)
+    )
+)
+
+(define-public (query-audit-trail
+    (patient principal)
+    (event-type (optional (string-ascii 20)))
+    (severity-filter (optional (string-ascii 10)))
+    (limit uint))
+    (let
+        (
+            (can-access (or (is-eq tx-sender patient)
+                          (is-eq tx-sender CONTRACT_OWNER)
+                          (is-some (get-patient-consent-for-audit tx-sender patient))))
+        )
+        (asserts! can-access ERR_AUDIT_ACCESS_DENIED)
+        (asserts! (> limit u0) ERR_INVALID_DURATION)
+        (asserts! (<= limit u50) ERR_INVALID_DURATION)
+        
+        (ok (fold search-audit-records
+            (generate-audit-id-list limit)
+            { 
+                patient: patient, 
+                event-filter: event-type, 
+                severity-filter: severity-filter,
+                results: (list),
+                count: u0
+            })
+        )
+    )
+)
+
+(define-public (generate-compliance-report 
+    (entity principal)
+    (report-type (string-ascii 10))
+    (time-start uint)
+    (time-end uint))
+    (let
+        (
+            (can-generate (or (is-eq tx-sender entity)
+                            (is-eq tx-sender CONTRACT_OWNER)
+                            (is-some (map-get? hospital-registry { hospital: tx-sender }))))
+        )
+        (asserts! can-generate ERR_AUDIT_ACCESS_DENIED)
+        (asserts! (<= time-start time-end) ERR_INVALID_TIME_RANGE)
+        (asserts! (or (is-eq report-type "patient") (is-eq report-type "hospital")) ERR_INVALID_AUDIT_LEVEL)
+        
+        (let
+            (
+                (patient-summary (if (is-eq report-type "patient")
+                    (get-patient-audit-summary entity)
+                    none))
+                (hospital-summary (if (is-eq report-type "hospital")
+                    (get-hospital-audit-summary entity)
+                    none))
+                (compliance-score (calculate-compliance-score entity report-type))
+            )
+            (ok {
+                entity: entity,
+                report-type: report-type,
+                time-range: { start: time-start, end: time-end },
+                patient-summary: patient-summary,
+                hospital-summary: hospital-summary,
+                compliance-score: compliance-score,
+                generated-at: stacks-block-height,
+                generated-by: tx-sender
+            })
+        )
+    )
+)
+
+(define-public (flag-security-violation
+    (violating-entity principal)
+    (violation-type (string-ascii 20))
+    (details (string-ascii 100)))
+    (begin
+        (asserts! (or (is-eq tx-sender CONTRACT_OWNER)
+                     (is-some (map-get? hospital-registry { hospital: tx-sender }))) ERR_AUDIT_ACCESS_DENIED)
+        
+        (try! (create-audit-record
+            "security_violation"
+            violating-entity
+            (some tx-sender)
+            none
+            details
+            "critical"
+        ))
+        
+        (match (map-get? hospital-audit-log { hospital: violating-entity })
+            existing-log (map-set hospital-audit-log
+                { hospital: violating-entity }
+                (merge existing-log { violations: (+ (get violations existing-log) u1) })
+            )
+            (map-set hospital-audit-log
+                { hospital: violating-entity }
+                { total-events: u1, compliance-score: u0, violations: u1 }
+            )
+        )
+        
+        (ok true)
     )
 )
 
@@ -322,6 +542,13 @@
         (update-patient-analytics-on-grant tx-sender hospital current-block)
         (update-hospital-analytics-on-grant hospital tx-sender (get permission-level template-data))
         (update-time-analytics-on-grant current-block tx-sender)
+        (try! (create-audit-record 
+            "access_granted" 
+            tx-sender 
+            (some hospital) 
+            (some token-id) 
+            "EHR access granted via template" 
+            "info"))
         
         (ok token-id)
     )
@@ -416,6 +643,13 @@
         (update-patient-analytics-on-grant tx-sender hospital current-block)
         (update-hospital-analytics-on-grant hospital tx-sender permission-level)
         (update-time-analytics-on-grant current-block tx-sender)
+        (try! (create-audit-record 
+            "access_granted" 
+            tx-sender 
+            (some hospital) 
+            (some token-id) 
+            "EHR access granted directly" 
+            "info"))
         
         (ok token-id)
     )
@@ -431,6 +665,13 @@
             { token-id: token-id }
             (merge permission-data { revoked: true })
         )
+        (try! (create-audit-record 
+            "access_revoked" 
+            (get patient permission-data) 
+            (some (get hospital permission-data)) 
+            (some token-id) 
+            "Patient revoked EHR access" 
+            "warning"))
         (ok true)
     )
 )
@@ -457,6 +698,13 @@
         (update-patient-analytics-on-access (get patient permission-data) current-block)
         (update-hospital-analytics-on-access (get hospital permission-data))
         (update-time-analytics-on-access current-block (get patient permission-data))
+        (try! (create-audit-record 
+            "data_accessed" 
+            (get patient permission-data) 
+            (some (get hospital permission-data)) 
+            (some token-id) 
+            "Healthcare provider accessed EHR data" 
+            "info"))
         
         (ok {
             ehr-hash: (get ehr-hash permission-data),
@@ -493,6 +741,13 @@
                 { ehr-hash: "EMERGENCY_REVOKED" }
             )
         )
+        (try! (create-audit-record 
+            "emergency_revoke" 
+            patient 
+            none 
+            none 
+            "Emergency revocation of all access" 
+            "emergency"))
         (ok true)
     )
 )
@@ -625,6 +880,146 @@
                 analytics (merge analytics { access-count: (+ (get access-count analytics) u1) })
                 { access-count: u1, grant-count: u0, revoke-count: u0 }
             )
+        )
+    )
+)
+
+;; Audit Trail Helper Functions
+(define-private (update-patient-audit-log (patient principal) (audit-id uint) (severity (string-ascii 10)))
+    (let
+        (
+            (existing-log (map-get? patient-audit-log { patient: patient }))
+            (is-high-risk (or (is-eq severity "critical") (is-eq severity "emergency")))
+        )
+        (map-set patient-audit-log
+            { patient: patient }
+            (match existing-log
+                log (merge log {
+                    total-events: (+ (get total-events log) u1),
+                    last-audit-id: audit-id,
+                    high-risk-events: (if is-high-risk 
+                        (+ (get high-risk-events log) u1) 
+                        (get high-risk-events log))
+                })
+                { total-events: u1, last-audit-id: audit-id, high-risk-events: (if is-high-risk u1 u0) }
+            )
+        )
+    )
+)
+
+(define-private (update-hospital-audit-log (hospital principal) (severity (string-ascii 10)))
+    (let
+        (
+            (existing-log (map-get? hospital-audit-log { hospital: hospital }))
+            (is-violation (or (is-eq severity "critical") (is-eq severity "emergency")))
+            (score-penalty (if is-violation u10 u0))
+        )
+        (map-set hospital-audit-log
+            { hospital: hospital }
+            (match existing-log
+                log (merge log {
+                    total-events: (+ (get total-events log) u1),
+                    compliance-score: (if (> (get compliance-score log) score-penalty)
+                        (- (get compliance-score log) score-penalty)
+                        u0),
+                    violations: (if is-violation 
+                        (+ (get violations log) u1) 
+                        (get violations log))
+                })
+                { total-events: u1, compliance-score: (if is-violation u90 u100), violations: (if is-violation u1 u0) }
+            )
+        )
+    )
+)
+
+(define-private (update-audit-search-index (event-type (string-ascii 20)) (entity principal) (audit-id uint))
+    (let
+        (
+            (existing-index (map-get? audit-search-index { event-type: event-type, entity: entity }))
+        )
+        (map-set audit-search-index
+            { event-type: event-type, entity: entity }
+            (match existing-index
+                index (merge index {
+                    event-count: (+ (get event-count index) u1),
+                    last-event-id: audit-id
+                })
+                { event-count: u1, last-event-id: audit-id }
+            )
+        )
+    )
+)
+
+(define-private (get-patient-consent-for-audit (requester principal) (patient principal))
+    (get found (fold check-audit-permissions
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+        { patient: patient, requester: requester, found: none }
+    ))
+)
+
+(define-private (check-audit-permissions (token-id uint) (data { patient: principal, requester: principal, found: (optional bool) }))
+    (if (is-some (get found data))
+        data
+        (match (map-get? access-permissions { token-id: token-id })
+            permission
+            (if (and
+                    (is-eq (get patient permission) (get patient data))
+                    (is-eq (get granted-to permission) (get requester data))
+                    (not (get revoked permission))
+                    (> (get expires-at permission) stacks-block-height)
+                    (or (is-eq (get permission-level permission) "admin")
+                        (is-eq (get permission-level permission) "modify"))
+                )
+                (merge data { found: (some true) })
+                data
+            )
+            data
+        )
+    )
+)
+
+(define-private (calculate-compliance-score (entity principal) (report-type (string-ascii 10)))
+    (if (is-eq report-type "patient")
+        (match (get-patient-audit-summary entity)
+            summary (if (> (get high-risk-events summary) u0)
+                (- u100 (* (get high-risk-events summary) u5))
+                u100)
+            u100
+        )
+        (match (get-hospital-audit-summary entity)
+            summary (get compliance-score summary)
+            u100
+        )
+    )
+)
+
+(define-private (generate-audit-id-list (limit uint))
+    (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50)
+)
+
+(define-private (search-audit-records (audit-id uint) (search-data { patient: principal, event-filter: (optional (string-ascii 20)), severity-filter: (optional (string-ascii 10)), results: (list 50 uint), count: uint }))
+    (if (>= (get count search-data) u50)
+        search-data
+        (match (map-get? audit-trail { audit-id: audit-id })
+            record
+            (if (and
+                    (is-eq (get patient record) (get patient search-data))
+                    (match (get event-filter search-data)
+                        event-type (is-eq (get event-type record) event-type)
+                        true
+                    )
+                    (match (get severity-filter search-data)
+                        severity (is-eq (get severity-level record) severity)
+                        true
+                    )
+                )
+                (merge search-data {
+                    results: (unwrap-panic (as-max-len? (append (get results search-data) audit-id) u50)),
+                    count: (+ (get count search-data) u1)
+                })
+                search-data
+            )
+            search-data
         )
     )
 )
