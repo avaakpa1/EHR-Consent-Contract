@@ -20,8 +20,13 @@
 (define-constant ERR_AUDIT_ACCESS_DENIED (err u114))
 (define-constant ERR_INVALID_AUDIT_LEVEL (err u115))
 (define-constant ERR_AUDIT_NOT_FOUND (err u116))
+(define-constant ERR_DELEGATE_NOT_FOUND (err u117))
+(define-constant ERR_DELEGATE_ALREADY_EXISTS (err u118))
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u119))
+(define-constant ERR_DELEGATE_INACTIVE (err u120))
 
 (define-data-var last-token-id uint u0)
+(define-data-var last-delegation-id uint u0)
 (define-data-var oracle-address (optional principal) none)
 (define-data-var last-template-id uint u0)
 (define-data-var last-audit-id uint u0)
@@ -123,6 +128,29 @@
     { event-count: uint, last-event-id: uint }
 )
 
+(define-map patient-delegates
+    { delegation-id: uint }
+    {
+        patient: principal,
+        delegate: principal,
+        permission-scope: (string-ascii 20),
+        created-at: uint,
+        expires-at: uint,
+        active: bool,
+        usage-count: uint
+    }
+)
+
+(define-map active-delegations
+    { patient: principal, delegate: principal }
+    { delegation-id: uint }
+)
+
+(define-map delegate-registry
+    { delegate: principal }
+    { total-delegations: uint, active-count: uint, last-action: uint }
+)
+
 (define-read-only (get-last-token-id)
     (var-get last-token-id)
 )
@@ -133,6 +161,36 @@
 
 (define-read-only (get-last-audit-id)
     (var-get last-audit-id)
+)
+
+(define-read-only (get-last-delegation-id)
+    (var-get last-delegation-id)
+)
+
+(define-read-only (get-delegation (delegation-id uint))
+    (map-get? patient-delegates { delegation-id: delegation-id })
+)
+
+(define-read-only (get-active-delegation (patient principal) (delegate principal))
+    (match (map-get? active-delegations { patient: patient, delegate: delegate })
+        delegation-ref (map-get? patient-delegates { delegation-id: (get delegation-id delegation-ref) })
+        none
+    )
+)
+
+(define-read-only (get-delegate-info (delegate principal))
+    (map-get? delegate-registry { delegate: delegate })
+)
+
+(define-read-only (is-valid-delegate (patient principal) (delegate principal))
+    (match (get-active-delegation patient delegate)
+        delegation-data
+        (and
+            (get active delegation-data)
+            (> (get expires-at delegation-data) stacks-block-height)
+        )
+        false
+    )
 )
 
 (define-read-only (get-audit-record (audit-id uint))
@@ -551,6 +609,204 @@
             "info"))
         
         (ok token-id)
+    )
+)
+
+(define-public (create-delegation (delegate principal) (permission-scope (string-ascii 20)) (duration uint))
+    (let
+        (
+            (delegation-id (+ (var-get last-delegation-id) u1))
+            (current-block stacks-block-height)
+            (expires-at (+ current-block duration))
+        )
+        (asserts! (is-some (map-get? patient-records { patient: tx-sender })) ERR_NOT_TOKEN_OWNER)
+        (asserts! (not (is-eq tx-sender delegate)) ERR_CANNOT_DELEGATE_TO_SELF)
+        (asserts! (is-none (map-get? active-delegations { patient: tx-sender, delegate: delegate })) ERR_DELEGATE_ALREADY_EXISTS)
+        (asserts! (> duration u0) ERR_INVALID_DURATION)
+        (asserts! (or (is-eq permission-scope "grant") 
+                     (or (is-eq permission-scope "revoke") 
+                         (is-eq permission-scope "full"))) ERR_INVALID_PERMISSION)
+        
+        (map-set patient-delegates
+            { delegation-id: delegation-id }
+            {
+                patient: tx-sender,
+                delegate: delegate,
+                permission-scope: permission-scope,
+                created-at: current-block,
+                expires-at: expires-at,
+                active: true,
+                usage-count: u0
+            }
+        )
+        
+        (map-set active-delegations
+            { patient: tx-sender, delegate: delegate }
+            { delegation-id: delegation-id }
+        )
+        
+        (map-set delegate-registry
+            { delegate: delegate }
+            (match (map-get? delegate-registry { delegate: delegate })
+                registry (merge registry { 
+                    total-delegations: (+ (get total-delegations registry) u1),
+                    active-count: (+ (get active-count registry) u1),
+                    last-action: current-block
+                })
+                { total-delegations: u1, active-count: u1, last-action: current-block }
+            )
+        )
+        
+        (var-set last-delegation-id delegation-id)
+        (try! (create-audit-record 
+            "access_granted" 
+            tx-sender 
+            none 
+            none 
+            "Delegation created for healthcare proxy" 
+            "info"))
+        (ok delegation-id)
+    )
+)
+
+(define-public (revoke-delegation (delegation-id uint))
+    (let
+        (
+            (delegation-data (unwrap! (map-get? patient-delegates { delegation-id: delegation-id }) ERR_DELEGATE_NOT_FOUND))
+        )
+        (asserts! (is-eq tx-sender (get patient delegation-data)) ERR_UNAUTHORIZED)
+        (asserts! (get active delegation-data) ERR_DELEGATE_INACTIVE)
+        
+        (map-set patient-delegates
+            { delegation-id: delegation-id }
+            (merge delegation-data { active: false })
+        )
+        
+        (map-delete active-delegations { patient: (get patient delegation-data), delegate: (get delegate delegation-data) })
+        
+        (match (map-get? delegate-registry { delegate: (get delegate delegation-data) })
+            registry (map-set delegate-registry
+                { delegate: (get delegate delegation-data) }
+                (merge registry { active-count: (if (> (get active-count registry) u0) (- (get active-count registry) u1) u0) })
+            )
+            false
+        )
+        
+        (try! (create-audit-record 
+            "access_revoked" 
+            (get patient delegation-data) 
+            none 
+            none 
+            "Delegation revoked" 
+            "warning"))
+        (ok true)
+    )
+)
+
+(define-public (delegate-grant-access (patient principal) (to principal) (hospital principal) (permission-level (string-ascii 10)) (duration uint))
+    (let
+        (
+            (delegation-data (unwrap! (get-active-delegation patient tx-sender) ERR_DELEGATE_NOT_FOUND))
+            (token-id (+ (var-get last-token-id) u1))
+            (patient-record (unwrap! (map-get? patient-records { patient: patient }) ERR_NOT_TOKEN_OWNER))
+            (hospital-data (unwrap! (map-get? hospital-registry { hospital: hospital }) ERR_HOSPITAL_NOT_REGISTERED))
+            (current-block stacks-block-height)
+            (expires-at (+ current-block duration))
+        )
+        (asserts! (get active delegation-data) ERR_DELEGATE_INACTIVE)
+        (asserts! (> (get expires-at delegation-data) current-block) ERR_TOKEN_EXPIRED)
+        (asserts! (or (is-eq (get permission-scope delegation-data) "grant")
+                     (is-eq (get permission-scope delegation-data) "full")) ERR_PERMISSION_DENIED)
+        (asserts! (get verified hospital-data) ERR_HOSPITAL_NOT_REGISTERED)
+        (asserts! (is-valid-permission permission-level) ERR_INVALID_PERMISSION)
+        (asserts! (> duration u0) ERR_INVALID_DURATION)
+        
+        (try! (nft-mint? ehr-access-key token-id to))
+        
+        (map-set access-permissions
+            { token-id: token-id }
+            {
+                patient: patient,
+                granted-to: to,
+                permission-level: permission-level,
+                expires-at: expires-at,
+                revoked: false,
+                hospital: hospital,
+                ehr-hash: (get ehr-hash patient-record)
+            }
+        )
+        
+        (map-set permission-usage
+            { token-id: token-id }
+            { access-count: u0, last-accessed: u0 }
+        )
+        
+        (var-set last-token-id token-id)
+        
+        (map-set patient-consent-history
+            { patient: patient, hospital: hospital }
+            (match (map-get? patient-consent-history { patient: patient, hospital: hospital })
+                history (merge history { total-grants: (+ (get total-grants history) u1), last-granted: current-block })
+                { total-grants: u1, last-granted: current-block }
+            )
+        )
+        
+        (update-patient-analytics-on-grant patient hospital current-block)
+        (update-hospital-analytics-on-grant hospital patient permission-level)
+        (update-time-analytics-on-grant current-block patient)
+        (increment-delegation-usage (get delegation-id (unwrap-panic (map-get? active-delegations { patient: patient, delegate: tx-sender }))))
+        (try! (create-audit-record 
+            "access_granted" 
+            patient 
+            (some hospital) 
+            (some token-id) 
+            "EHR access granted by delegate" 
+            "info"))
+        
+        (ok token-id)
+    )
+)
+
+(define-public (delegate-revoke-access (patient principal) (token-id uint))
+    (let
+        (
+            (delegation-data (unwrap! (get-active-delegation patient tx-sender) ERR_DELEGATE_NOT_FOUND))
+            (permission-data (unwrap! (map-get? access-permissions { token-id: token-id }) ERR_TOKEN_NOT_FOUND))
+            (current-block stacks-block-height)
+        )
+        (asserts! (is-eq patient (get patient permission-data)) ERR_UNAUTHORIZED)
+        (asserts! (get active delegation-data) ERR_DELEGATE_INACTIVE)
+        (asserts! (> (get expires-at delegation-data) current-block) ERR_TOKEN_EXPIRED)
+        (asserts! (or (is-eq (get permission-scope delegation-data) "revoke")
+                     (is-eq (get permission-scope delegation-data) "full")) ERR_PERMISSION_DENIED)
+        
+        (map-set access-permissions
+            { token-id: token-id }
+            (merge permission-data { revoked: true })
+        )
+        
+        (increment-delegation-usage (get delegation-id (unwrap-panic (map-get? active-delegations { patient: patient, delegate: tx-sender }))))
+        (try! (create-audit-record 
+            "access_revoked" 
+            patient 
+            (some (get hospital permission-data)) 
+            (some token-id) 
+            "EHR access revoked by delegate" 
+            "warning"))
+        (ok true)
+    )
+)
+
+(define-private (increment-delegation-usage (delegation-id uint))
+    (match (map-get? patient-delegates { delegation-id: delegation-id })
+        delegation (begin
+            (map-set patient-delegates
+                { delegation-id: delegation-id }
+                (merge delegation { usage-count: (+ (get usage-count delegation) u1) })
+            )
+            true
+        )
+        false
     )
 )
 
